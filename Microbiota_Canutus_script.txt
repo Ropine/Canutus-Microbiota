@@ -1,0 +1,773 @@
+### Plazanet Aymeric ### MNHN ## M1 ## SEP ##
+### Fuchs Jérôme ### MNHN ## ISYEB ## SPEC team ##
+### Calidris microbiota ###
+## M1 internship ##
+## 17/06/2022 ##
+
+setwd("/Travail_et_Etudes/MNHN/M1/Stage/Bio_Info/Data_MB")
+
+#install.packages("devtools")
+library("devtools")
+#devtools::install_github("benjjneb/dada2")
+library(dada2)
+
+setwd("/Travail_et_Etudes/MNHN/M1/Stage/Bio_Info/Data_MB")
+path <- "/Travail_et_Etudes/MNHN/M1/Stage/Bio_Info/Data_MB" # change to the directory containing the fastq files after unzipping
+list.files(path)
+
+# Forward and reverse fastq filenames have format: SAMPLENAME_R1_001.fastq and SAMPLENAME_R2_001.fastq
+fnFs <- sort(list.files(path, pattern="_R1_001.fastq*", full.names = TRUE))
+fnRs <- sort(list.files(path, pattern="_R2_001.fastq*", full.names = TRUE))
+# Extraire les noms des échantillons, en supposant que les noms de fichiers ont le format: SAMPLENAME_XXX.fastq
+sample.names <- sapply(strsplit(basename(fnFs), "_"), `[`, 1)
+sample.names
+
+plotQualityProfile(fnFs[1:2]) # visualizing the quality profiles of the forward reads
+plotQualityProfile(fnRs[1:2]) # visualizing the quality profiles of the reverse reads
+
+
+filt_path <- file.path(path, "filtered") # Place filtered files in filtered/ subdirectory
+filtFs <- file.path(filt_path, paste0(sample.names, "_F_filt.fastq.gz"))
+filtRs <- file.path(filt_path, paste0(sample.names, "_R_filt.fastq.gz"))
+
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, truncLen=c(240,160),
+                     maxN=0, maxEE=c(2,2), truncQ=2, rm.phix=TRUE,
+                     compress=TRUE, multithread=FALSE) # On Windows set multithread=FALSE
+out
+write.csv(out, file='Sample_reads_MB.csv')
+errF <- learnErrors(filtFs, multithread=TRUE) # estimate error rates in forward sequences
+errR <- learnErrors(filtRs, multithread=TRUE) # estimate error rates in reverse sequences
+#plotErrors(errF, nominalQ=TRUE)
+
+derepFs <- derepFastq(filtFs, verbose=TRUE)
+derepRs <- derepFastq(filtRs, verbose=TRUE)
+
+names(derepFs) <- sample.names
+names(derepRs) <- sample.names
+
+dadaFs <- dada(derepFs, err=errF, multithread=TRUE) # Infer the sequence variants in each sample
+dadaRs <- dada(derepRs, err=errR, multithread=TRUE)
+dadaFs[[1]]
+
+mergers <- mergePairs(dadaFs, derepFs, dadaRs, derepRs, verbose=TRUE)
+head(mergers[[1]])
+
+
+seqtab <- makeSequenceTable(mergers)
+dim(seqtab)
+
+table(nchar(getSequences(seqtab)))
+
+seqtab.nochim <- removeBimeraDenovo(seqtab, method="consensus", multithread=TRUE, verbose=TRUE)
+dim(seqtab.nochim)
+sum(seqtab.nochim)/sum(seqtab)
+
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out, sapply(dadaFs, getN), sapply(mergers, getN), rowSums(seqtab), rowSums(seqtab.nochim))
+
+colnames(track) <- c("input", "filtered", "denoised", "merged", "tabled", "nonchim")
+rownames(track) <- sample.names
+head(track)
+write.csv(track, file='track_MB.csv')
+
+taxa <- assignTaxonomy(seqtab.nochim, "/Travail_et_Etudes/MNHN/M1/Stage/Bio_Info/Data_MB/filtered/silva_nr_v138_train_set.fa.gz", multithread=TRUE)
+taxa <- addSpecies(taxa, "/Travail_et_Etudes/MNHN/M1/Stage/Bio_Info/Data_MB/filtered/silva_species_assignment_v138.fa.gz")
+
+taxa.print <- taxa # Removing sequence rownames for display only
+rownames(taxa.print) <- NULL
+head(taxa.print)
+write.csv(taxa.print, file='taxa_MB.csv')
+
+{r tree build}
+setwd("/Travail_et_Etudes/MNHN/M1/Stage/Bio_Info/Data_MB")
+library(doParallel) #packageVersion("doParallel")
+library(foreach) #packageVersion("foreach")
+library(DECIPHER)
+#install.packages("phangorn")
+library(phangorn)
+library(ggplot2)
+library(phyloseq)
+
+#Create multiple denovo alignment
+seqs <- getSequences(taxa)
+names(seqs) <- seqs # This propagates to the tip labels of the tree
+alignment <- AlignSeqs(DNAStringSet(seqs), anchor=NA,verbose=FALSE)
+ASV_table_test <- alignment <- AlignSeqs(DNAStringSet(seqs), anchor=NA,verbose=FALSE)
+write.csv(ASV_table_test, file='ASV_table_test.csv')
+
+#Construct a neighbor-joining tree, and then fit a Generalized time-reversible with Gamma rate variation
+#Maximum likelihood tree using the neighbor-joining tree as a starting point.
+phangAlign <- phyDat(as(alignment, "matrix"), type="DNA")
+dm <- dist.ml(phangAlign)
+treeNJ <- NJ(dm) # Note, tip order != sequence order
+fit = pml(treeNJ, data=phangAlign)
+fitGTR <- update(fit, k=4, inv=0.2)
+fitGTR <- optim.pml(fitGTR, model="GTR", optInv=TRUE, optGamma=TRUE,
+                    rearrangement = "stochastic", control = pml.control(trace = 0))
+fitGTR
+plot(fitGTR$tree)
+detach("package:phangorn", unload=TRUE)
+
+{r make phyloseq object}
+library(phyloseq)
+library(ggplot2)
+library(dplyr)
+
+#read in metadata
+metadata = read.table(file="metadata_MB.csv", sep=",", header=TRUE, row.names =c(1))
+
+
+#construct phyloseq object
+ps_gut <- phyloseq(otu_table(seqtab.nochim, taxa_are_rows=FALSE), 
+                   sample_data(metadata), 
+                   tax_table(taxa),phy_tree(fitGTR$tree))
+ps_gut#remove non-target
+ps_gut <- ps_gut %>%
+  subset_taxa(
+    Kingdom == "Bacteria" &
+      Family  != "mitochondria" &
+      Class   != "Chloroplast")
+
+{r Decontam}
+library(decontam)
+#remove contaminants from phyloseq. Make sure to only select sequences that belong to controls!
+BadTaxa<- c("TACGAAGGGGGCTAGCGTTGCTCGGAATCACTGGGCGTAAAGGGTGCGTAGGCGGGTCTTTAAGTCAGGGGTGAAATCCTGGAGCTCAACTCCAGAACTGCCTTTGATACTGAAGATCTTGAGTTCGGGAGAGGTGAGTGGAACTGCGAGTGTAGAGGTGAAATTCGTAGATATTCGCAAGAACACCAGTGGCGAAGGCGGCTCACTGGCCCGATACTGACGCTGAGGCACGAAAGCGTGGGGAGCAAACAGG","TACAGAGGGTGCAAGCGTTAATCGGAATTACTGGGCGTAAAGCGCGCGTAGGTGGTTAGTTAAGTTGGATGTGAAATCCCCGGGCTCAACCTGGGAACTGCATTCAAAACTGACTGACTAGAGTATGGTAGAGGGTGGTGGAATTTCCTGTGTAGCGGTGAAATGCGTAGATATAGGAAGGAACACCAGTGGCGAAGGCGACCACCTGGACTGATACTGACACTGAGGTGCGAAAGCGTGGGGAGCAAACAGG","TACGGAGGATGCGAGCGTTATCCGGATTTATTGGGTTTAAAGGGAGCGCAGACGGGGGGTTAAGTCAGCTGTGAAAGTTTGCGGCTCAACCGTAAAATTGCAGTTGATACTGGCCCTCTTGAGTGCAGTTGAGGTAGGCGGAATTCGTGGTGTAGCGGTGAAATGCTTAGATATCACGAAGAACTCCGATTGCGAAGGCAGCTTACTAAACTGTAACTGACGTTCATGCTCGAAAGTGTGGGTATCAAACAGG","TACGTAGGGTGCAAGCGTTAATCGGAATTACTGGGCGTAAAGCGTGCGCAGGCGGTTATGCAAGACAGAGGTGAAATCCCCGGGCTCAACCTGGGAACTGCCTTTGTGACTGCATGGCTAGAGTACGGTAGAGGGGGATGGAATTCCGCGTGTAGCAGTGAAATGCGTAGATATGCGGAGGAACACCGATGGCGAAGGCAATCCCCTGGACCTGTACTGACGCTCATGCACGAAAGCGTGGGGAGCAAACAGG")
+
+allTaxa = taxa_names(ps_gut)
+#allTaxa <- allTaxa[!(allTaxa %in% BadTaxa)]
+ps_gut = prune_taxa(allTaxa, ps_gut)
+ps_gut
+
+{r rarefaction for richness and bar plots}
+ps_gut_rarefied = rarefy_even_depth(ps_gut)
+
+
+{r Richness}
+library(ggpubr)
+
+mytheme <- theme(axis.line = element_line(colour = "black"),
+                 panel.background = element_rect(fill = "white"))
+
+richness<- estimate_richness(ps_gut_rarefied, split = TRUE, measures = c("Observed", "Chao1", "ACE", "Shannon", "Simpson", "InvSimpson"))
+write.csv(richness, file = "richness.csv")
+metadata_richness = read.table(file="richness.csv", sep=",", header=TRUE, row.names = c(1))
+
+###export richness file
+richness <- data.frame(richness, sample_data(ps_gut)) #combine richness with sample data
+write.csv(richness, file = "richness_sample.csv")
+richness = read.table(file="richness_sample.csv", sep=",", header=TRUE, row.names = c(1))
+
+
+###create canutus only and alpinus only richness dataframes
+canutus <- richness[ which(richness$Species=='C_canutus'), ]
+alpinus <- richness[ which(richness$Species=='C_alpinus'), ]
+
+###plot canutus sex
+Shannon_plot_canutus_sex <- ggplot(canutus, aes(x=Sex, y=Shannon)) + geom_boxplot(outlier.shape = NA)+ mytheme+ scale_x_discrete(limits=c("M","F")) + ylim(0, 6)+theme(axis.text=element_text(size=12))+ xlab("Sex")+ylab("Shannon Diversity Index") + ggtitle("C.canutus")+ theme(plot.title = element_text(size=13),axis.title.x = element_text(size=14),axis.title.y = element_text(size=14))
+Shannon_plot_canutus_sex
+
+###plot alpinus sex
+Shannon_plot_alpinus_sex <- ggplot(alpinus, aes(x=Sex, y=Shannon)) + geom_boxplot(outlier.shape = NA)+ mytheme+ scale_x_discrete(limits=c("M","F")) + ylim(0, 6)+theme(axis.text=element_text(size=12))+ xlab("Sex")+ylab("Shannon Diversity Index") + ggtitle("C.alpina")+ theme(plot.title = element_text(size=13),axis.title.x = element_text(size=14),axis.title.y=element_blank())+theme(axis.title=element_text(size=14, face="plain"))
+Shannon_plot_alpinus_sex
+ggsave("Shannon_plot_sex_alpina.png", device="png")
+
+ggarrange(Shannon_plot_canutus_sex,Shannon_plot_alpinus_sex)
+ggsave("Shannon_plot_sex_canutus&alpina.png", device="png")
+
+###plot canutus series
+Shannon_plot_canutus_series <- ggplot(canutus, aes(x=Series, y=Shannon)) + geom_boxplot(outlier.shape = NA)+ mytheme+ scale_x_discrete(limits=c("A","B","C","D")) + ylim(0, 6)+theme(axis.text=element_text(size=12))+ xlab("Series")+ylab("Shannon Diversity Index") + ggtitle("C.canutus")+ theme(plot.title = element_text(size=13),axis.title.x = element_text(size=14),axis.title.y = element_text(size=14))
+Shannon_plot_canutus_series
+
+###plot alpinus series
+Shannon_plot_alpinus_series <- ggplot(alpinus, aes(x=Series, y=Shannon)) + geom_boxplot(outlier.shape = NA)+ mytheme+ scale_x_discrete(limits=c("A","B","C","D")) + ylim(0, 6)+theme(axis.text=element_text(size=12))+ xlab("Series")+ylab("Shannon Diversity Index") + ggtitle("C.alpina")+ theme(plot.title = element_text(size=13),axis.title.x = element_text(size=14),axis.title.y=element_blank())+theme(axis.title=element_text(size=14, face="plain"))
+Shannon_plot_alpinus_series
+ggsave("Shannon_plot_series_alpina.png", device="png")
+
+ggarrange(Shannon_plot_canutus_series,Shannon_plot_alpinus_series)
+ggsave("Shannon_plot_series_canutus&alpina.png", device="png", width=15, height=15)
+
+###plot canutus ID
+Shannon_plot_canutus_ID <- ggplot(canutus, aes(x=ID, y=Shannon)) + geom_boxplot(outlier.shape = NA)+ mytheme+ scale_x_discrete(limits=NULL) + ylim(0, 6)+theme(axis.text=element_text(size=12))+ xlab("ID")+ylab("Shannon Diversity Index") + ggtitle("C.canutus")+ theme(plot.title = element_text(size=13),axis.title.x = element_text(size=14),axis.title.y = element_text(size=14))
+Shannon_plot_canutus_ID
+
+###plot alpinus ID
+Shannon_plot_alpinus_ID <- ggplot(alpinus, aes(x=ID, y=Shannon)) + geom_boxplot(outlier.shape = NA)+ mytheme+ scale_x_discrete(limits=NULL) + ylim(0, 6)+theme(axis.text=element_text(size=12))+ xlab("ID")+ylab("Shannon Diversity Index") + ggtitle("C.alpina")+ theme(plot.title = element_text(size=13),axis.title.x = element_text(size=14),axis.title.y=element_blank())+theme(axis.title=element_text(size=14, face="plain"))
+Shannon_plot_alpinus_ID
+ggsave("Shannon_plot_ID_alpina.png", device="png")
+
+###plot all series
+Shannon_plot_all_series <- ggplot(richness, aes(x=Series, y=Shannon)) + geom_boxplot(outlier.shape = NA)+ mytheme+ scale_x_discrete(limits=NULL) + ylim(0, 6)+theme(axis.text=element_text(size=12))+ xlab("Series")+ylab("Shannon Diversity Index") + ggtitle("All sample")+ theme(plot.title = element_text(size=13),axis.title.x = element_text(size=14),axis.title.y=element_blank())+theme(axis.title=element_text(size=14, face="plain"))
+Shannon_plot_all_series
+ggsave("Shannon_plot_series_all.png", device="png")
+
+ggarrange(Shannon_plot_canutus_ID,Shannon_plot_alpinus_ID)
+ggsave("Shannon_plot_ID_canutus&alpinus.png", device="png", width=25,height=10)
+
+###plot Species
+Shannon_plot_species <- ggplot(richness, aes(x=Species, y=Shannon)) + geom_boxplot(outlier.shape = NA)+ mytheme+ scale_x_discrete(limits=NULL) + ylim(0, 6)+theme(axis.text=element_text(size=12))+ xlab("Species")+ylab("Shannon Diversity Index") + ggtitle("All")+ theme(plot.title = element_text(size=13),axis.title.x = element_text(size=14),axis.title.y = element_text(size=14))
+Shannon_plot_species
+ggsave("Shannon_plot_species.png", device="png")
+
+
+{r alpha diversity stats}
+#Series
+fit_series_canutus <- aov(Shannon ~ Series, data=canutus)
+summary(fit_series_canutus)
+TukeyHSD(fit_series_canutus)
+
+fit_series_alpinus <- aov(Shannon ~ Series, data=alpinus)
+summary(fit_series_alpinus)
+TukeyHSD(fit_series_alpinus)
+
+#sex
+fit_sex_canutus <- aov(Shannon ~ Sex, data=canutus)
+summary(fit_sex_canutus)
+TukeyHSD(fit_sex_canutus)
+
+fit_sex_alpinus <- aov(Shannon ~ Sex, data=alpinus)
+summary(fit_sex_alpinus)
+TukeyHSD(fit_sex_alpinus)
+
+#species
+fit_sp <- aov(Shannon ~ Species, data=richness)
+summary(fit_sp)
+TukeyHSD(fit_sp)
+
+#sample
+fit_ID_canutus <- aov(Shannon ~ ID, data=canutus)
+summary(fit_ID_canutus)
+TukeyHSD(fit_ID_canutus)
+
+fit_ID_alpinus <- aov(Shannon ~ ID, data=alpinus)
+summary(fit_ID_alpinus)
+TukeyHSD(fit_ID_alpinus)
+
+
+{r Ordinations}
+ps_canutus<-subset_samples(ps_gut, Species=="C_canutus")
+ps_alpinus<-subset_samples(ps_gut, Species=="C_alpinus")
+
+ord.nmds.wunifrac <- ordinate(ps_gut, method="NMDS", distance="wunifrac")
+ord.nmds.uunifrac <- ordinate(ps_gut, method="NMDS", distance="uunifrac")
+ord.nmds.bray <- ordinate(ps_gut, method="NMDS", distance="bray")
+
+ord.nmds.wunifrac.canutus <- ordinate(ps_canutus, method="NMDS", distance="wunifrac")
+ord.nmds.uunifrac.canutus <- ordinate(ps_canutus, method="NMDS", distance="uunifrac")
+ord.nmds.bray.canutus <- ordinate(ps_canutus, method="NMDS", distance="bray")
+
+ord.nmds.wunifrac.alpinus <- ordinate(ps_alpinus, method="NMDS", distance="wunifrac")
+ord.nmds.uunifrac.alpinus <- ordinate(ps_alpinus, method="NMDS", distance="uunifrac")
+ord.nmds.bray.alpinus <- ordinate(ps_alpinus, method="NMDS", distance="bray")
+
+###Series
+#all species all series
+all_series_bray<- plot_ordination(ps_gut, ord.nmds.bray) + theme(panel.background = element_rect(fill="white", colour="black", size=0.5, linetype="solid"))+ theme(text = element_text(size=10))+ theme(axis.title.x=element_blank())+ theme(axis.title.y=element_blank())+ geom_point(aes(color = Series, shape=Species), size=4) + theme(legend.title=element_blank())+ theme(legend.key=element_blank(), legend.text=element_text(size=12))
+all_series_bray
+
+#Canutus all series bray
+canutus_series<- plot_ordination(ps_canutus, ord.nmds.bray.canutus) + theme(panel.background = element_rect(fill="white", colour="black", size=0.5, linetype="solid"))+ theme(text = element_text(size=10))+ theme(axis.title.x=element_blank())+ theme(axis.title.y=element_blank())+ geom_point(aes(color = Series), size=3) + theme(legend.key=element_blank())+ theme(legend.title=element_blank())
+canutus_series
+
+#Alpinus all series bray
+alpinus_series<- plot_ordination(ps_alpinus, ord.nmds.bray.alpinus) + theme(panel.background = element_rect(fill="white", colour="black", size=0.5, linetype="solid"))+ theme(text = element_text(size=10))+ theme(axis.title.x=element_blank())+ theme(axis.title.y=element_blank())+ geom_point(aes(color = Series), size=3) + theme(legend.key=element_blank())+ theme(legend.title=element_blank())
+alpinus_series
+
+#All species all series unifrac
+all_series_uunifrac<- plot_ordination(ps_gut, ord.nmds.uunifrac) + theme(panel.background = element_rect(fill="white", colour="black", size=0.5, linetype="solid"))+ theme(text = element_text(size=10))+ theme(axis.title.x=element_blank())+ theme(axis.title.y=element_blank())+ geom_point(aes(color = Series, shape=Species), size=4)+ theme(legend.title=element_blank())+ theme(legend.key=element_blank(), legend.text=element_text(size=12))
+all_series_uunifrac
+
+#Canutus all series unifrac
+canutus_series_uunifrac<- plot_ordination(ps_canutus, ord.nmds.uunifrac.canutus) + theme(panel.background = element_rect(fill="white", colour="black", size=0.5, linetype="solid"))+ theme(text = element_text(size=10))+ theme(axis.title.x=element_blank())+ theme(axis.title.y=element_blank())+ geom_point(aes(color = Series, shape=Species), size=4)+ theme(legend.title=element_blank())+ theme(legend.key=element_blank(), legend.text=element_text(size=12))
+canutus_series_uunifrac
+
+#Alpinus all series unifrac
+alpinus_series_uunifrac<- plot_ordination(ps_alpinus, ord.nmds.uunifrac.alpinus) + theme(panel.background = element_rect(fill="white", colour="black", size=0.5, linetype="solid"))+ theme(text = element_text(size=10))+ theme(axis.title.x=element_blank())+ theme(axis.title.y=element_blank())+ geom_point(aes(color = Series, shape=Species), size=4)+ theme(legend.title=element_blank())+ theme(legend.key=element_blank(), legend.text=element_text(size=12))
+alpinus_series_uunifrac
+
+
+###Sex
+#all species all sex
+all_sex_bray<- plot_ordination(ps_gut, ord.nmds.bray) + theme(panel.background = element_rect(fill="white", colour="black", size=0.5, linetype="solid"))+ theme(text = element_text(size=10))+ theme(axis.title.x=element_blank())+ theme(axis.title.y=element_blank())+ geom_point(aes(color = Sex, shape=Species), size=4) + theme(legend.title=element_blank())+ theme(legend.key=element_blank(), legend.text=element_text(size=12))
+all_sex_bray
+
+#Canutus all sex bray
+canutus_sex_bray<- plot_ordination(ps_canutus, ord.nmds.bray.canutus) + theme(panel.background = element_rect(fill="white", colour="black", size=0.5, linetype="solid"))+ theme(text = element_text(size=10))+ theme(axis.title.x=element_blank())+ theme(axis.title.y=element_blank())+ geom_point(aes(color = Sex), size=3) + theme(legend.key=element_blank())+ theme(legend.title=element_blank())
+canutus_sex_bray
+
+#Alpinus all sex bray
+alpinus_sex_bray<- plot_ordination(ps_alpinus, ord.nmds.bray.alpinus) + theme(panel.background = element_rect(fill="white", colour="black", size=0.5, linetype="solid"))+ theme(text = element_text(size=10))+ theme(axis.title.x=element_blank())+ theme(axis.title.y=element_blank())+ geom_point(aes(color = Sex), size=3) + theme(legend.key=element_blank())+ theme(legend.title=element_blank())
+alpinus_sex_bray
+
+#All species all sex unifrac
+all_sex_uunifrac<- plot_ordination(ps_gut, ord.nmds.uunifrac) + theme(panel.background = element_rect(fill="white", colour="black", size=0.5, linetype="solid"))+ theme(text = element_text(size=10))+ theme(axis.title.x=element_blank())+ theme(axis.title.y=element_blank())+ geom_point(aes(color = Sex, shape=Species), size=4)+ theme(legend.title=element_blank())+ theme(legend.key=element_blank(), legend.text=element_text(size=12))
+all_sex_uunifrac
+
+#Canutus all sex unifrac
+canutus_sex_uunifrac<- plot_ordination(ps_canutus, ord.nmds.uunifrac.canutus) + theme(panel.background = element_rect(fill="white", colour="black", size=0.5, linetype="solid"))+ theme(text = element_text(size=10))+ theme(axis.title.x=element_blank())+ theme(axis.title.y=element_blank())+ geom_point(aes(color = Sex, shape=Species), size=4)+ theme(legend.title=element_blank())+ theme(legend.key=element_blank(), legend.text=element_text(size=12))
+canutus_sex_uunifrac
+
+#Alpinus all sex unifrac
+alpinus_sex_uunifrac<- plot_ordination(ps_alpinus, ord.nmds.uunifrac.alpinus) + theme(panel.background = element_rect(fill="white", colour="black", size=0.5, linetype="solid"))+ theme(text = element_text(size=10))+ theme(axis.title.x=element_blank())+ theme(axis.title.y=element_blank())+ geom_point(aes(color = Sex, shape=Species), size=4)+ theme(legend.title=element_blank())+ theme(legend.key=element_blank(), legend.text=element_text(size=12))
+alpinus_sex_uunifrac
+
+###Individuals
+#all species all individuals bray
+all_individuals_bray<- plot_ordination(ps_gut, ord.nmds.bray) + theme(panel.background = element_rect(fill="white", colour="black", size=0.5, linetype="solid"))+ theme(text = element_text(size=10))+ theme(axis.title.x=element_blank())+ theme(axis.title.y=element_blank())+ geom_point(aes(color = ID), size=3) + theme(legend.key=element_blank())+ theme(legend.title=element_blank())
+all_individuals_bray
+
+#Canutus all individuals bray
+canutus_individuals_bray<- plot_ordination(ps_canutus, ord.nmds.bray.canutus) + theme(panel.background = element_rect(fill="white", colour="black", size=0.5, linetype="solid"))+ theme(text = element_text(size=10))+ theme(axis.title.x=element_blank())+ theme(axis.title.y=element_blank())+ geom_point(aes(color = ID, shape=Species), size=4)+ theme(legend.title=element_blank())+ theme(legend.key=element_blank(), legend.text=element_text(size=12))
+canutus_individuals_bray
+
+#Alpinus all individuals bray
+alpinus_individuals_bray<- plot_ordination(ps_alpinus, ord.nmds.bray.alpinus) + theme(panel.background = element_rect(fill="white", colour="black", size=0.5, linetype="solid"))+ theme(text = element_text(size=10))+ theme(axis.title.x=element_blank())+ theme(axis.title.y=element_blank())+ geom_point(aes(color = ID, shape=Species), size=4)+ theme(legend.title=element_blank())+ theme(legend.key=element_blank(), legend.text=element_text(size=12))
+alpinus_individuals_bray
+
+#all species all individuals uunifrac
+all_individuals_uunifrac<- plot_ordination(ps_gut, ord.nmds.uunifrac) + theme(panel.background = element_rect(fill="white", colour="black", size=0.5, linetype="solid"))+ theme(text = element_text(size=10))+ theme(axis.title.x=element_blank())+ theme(axis.title.y=element_blank())+ geom_point(aes(color = ID, shape = ID), size=3) +scale_shape_manual(values=c(0:23))+ theme(legend.key=element_blank())+ theme(legend.title=element_blank())
+all_individuals_uunifrac
+
+#Canutus all individuals unifrac
+canutus_individuals_uunifrac<- plot_ordination(ps_canutus, ord.nmds.uunifrac.canutus) + theme(panel.background = element_rect(fill="white", colour="black", size=0.5, linetype="solid"))+ theme(text = element_text(size=10))+ theme(axis.title.x=element_blank())+ theme(axis.title.y=element_blank())+ geom_point(aes(shape=ID), size=4)+scale_shape_manual(values=c(0:21))+ theme(legend.title=element_blank())+ theme(legend.key=element_blank(), legend.text=element_text(size=12))
+canutus_individuals_uunifrac
+
+#Alpinus all individuals unifrac
+alpinus_individuals_uunifrac<- plot_ordination(ps_alpinus, ord.nmds.uunifrac.alpinus) + theme(panel.background = element_rect(fill="white", colour="black", size=0.5, linetype="solid"))+ theme(text = element_text(size=10))+ theme(axis.title.x=element_blank())+ theme(axis.title.y=element_blank())+ geom_point(aes(color = ID, shape=Species), size=4)+ theme(legend.title=element_blank())+ theme(legend.key=element_blank(), legend.text=element_text(size=12))
+alpinus_individuals_uunifrac
+
+#all species all individuals wunifrac
+all_individuals_wunifrac<- plot_ordination(ps_gut, ord.nmds.wunifrac) + theme(panel.background = element_rect(fill="white", colour="black", size=0.5, linetype="solid"))+ theme(text = element_text(size=10))+ theme(axis.title.x=element_blank())+ theme(axis.title.y=element_blank())+ geom_point(aes(color = ID, shape = ID), size=3) +scale_shape_manual(values=c(0:23))+ theme(legend.key=element_blank())+ theme(legend.title=element_blank())
+all_individuals_wunifrac
+
+
+{r permanova}
+library(vegan)
+
+canutus_metadata <- metadata[ which(richness$Species=='C_canutus'), ] #subset canutus metadata
+alpinus_metadata <- metadata[ which(richness$Species=='C_alpinus'), ] #subset alpinus metadata
+
+#Uunifrac
+
+dist.uunifrac <- phyloseq::distance(ps_gut, method = "unifrac")
+all_permanova_uunifrac_1 <- adonis(dist.uunifrac ~ ID+Series, data = metadata, perm=999, na.rm = TRUE)
+all_permanova_uunifrac_2 <- adonis(dist.uunifrac ~ Species+Sex, data = metadata, perm=999, na.rm = TRUE)
+all_permanova_uunifrac_1[["aov.tab"]]
+all_permanova_uunifrac_2[["aov.tab"]]
+
+dist.uunifrac_canutus <- phyloseq::distance(ps_canutus, method = "unifrac")
+canutus_permanova_uunifrac_1 <- adonis(dist.uunifrac_canutus ~ ID+Sex+Series, data = canutus_metadata, perm=999, na.rm = TRUE,ncol=4)
+canutus_permanova_uunifrac_2 <- adonis(dist.uunifrac_canutus ~ Sex, data = canutus_metadata, perm=999, na.rm = TRUE)
+canutus_permanova_uunifrac_1[["aov.tab"]]
+canutus_permanova_uunifrac_2[["aov.tab"]]
+
+dist.uunifrac_alpinus <- phyloseq::distance(ps_alpinus, method = "unifrac")
+alpinus_permanova_uunifrac_1 <- adonis(dist.uunifrac_alpinus ~ ID+Series, data = alpinus_metadata, perm=999, na.rm = TRUE)
+alpinus_permanova_uunifrac_2 <- adonis(dist.uunifrac_alpinus ~ Sex, data = alpinus_metadata, perm=999, na.rm = TRUE)
+alpinus_permanova_uunifrac_1[["aov.tab"]]
+alpinus_permanova_uunifrac_2[["aov.tab"]]
+
+#Wunifrac
+dist.wunifrac <- phyloseq::distance(ps_gut, method = "wunifrac")
+all_permanova_wunifrac_1 <- adonis(dist.wunifrac ~ ID+Series, data = metadata, perm=999, na.rm = TRUE)
+all_permanova_wunifrac_2 <- adonis(dist.wunifrac ~ Species+Sex, data = metadata, perm=999, na.rm = TRUE)
+all_permanova_wunifrac_1[["aov.tab"]]
+all_permanova_wunifrac_2[["aov.tab"]]
+
+dist.wunifrac_canutus <- phyloseq::distance(ps_canutus, method = "wunifrac")
+canutus_permanova_wunifrac_1 <- adonis(dist.wunifrac_canutus ~ ID+Sex+Series, data = canutus_metadata, perm=999, na.rm = TRUE,ncol=4)
+canutus_permanova_wunifrac_2 <- adonis(dist.wunifrac_canutus ~ Sex, data = canutus_metadata, perm=999, na.rm = TRUE)
+canutus_permanova_wunifrac_1[["aov.tab"]]
+canutus_permanova_wunifrac_2[["aov.tab"]]
+
+dist.wunifrac_alpinus <- phyloseq::distance(ps_alpinus, method = "wunifrac")
+alpinus_permanova_wunifrac_1 <- adonis(dist.wunifrac_alpinus ~ ID+Series, data = alpinus_metadata, perm=999, na.rm = TRUE)
+alpinus_permanova_wunifrac_2 <- adonis(dist.wunifrac_alpinus ~ Sex, data = alpinus_metadata, perm=999, na.rm = TRUE)
+alpinus_permanova_wunifrac_1[["aov.tab"]]
+alpinus_permanova_wunifrac_2[["aov.tab"]]
+
+#Bray
+
+dist.bray <- phyloseq::distance(ps_gut, method = "bray")
+all_permanova_bray_1 <- adonis(dist.bray ~ ID+Series, data = metadata, perm=999, na.rm = TRUE)
+all_permanova_bray_2 <- adonis(dist.bray ~ Species+Sex, data = metadata, perm=999, na.rm = TRUE)
+all_permanova_bray_1[["aov.tab"]]
+all_permanova_bray_2[["aov.tab"]]
+
+dist.bray_canutus <- phyloseq::distance(ps_canutus, method = "unifrac")
+canutus_permanova_bray_1 <- adonis(dist.uunifrac_canutus ~ ID+Series, data = canutus_metadata, perm=999, na.rm = TRUE)
+canutus_permanova_bray_2 <- adonis(dist.uunifrac_canutus ~ Sex, data = canutus_metadata, perm=999, na.rm = TRUE)
+canutus_permanova_bray_1[["aov.tab"]]
+canutus_permanova_bray_2[["aov.tab"]]
+
+dist.bray_alpinus <- phyloseq::distance(ps_alpinus, method = "unifrac")
+alpinus_permanova_bray_1 <- adonis(dist.uunifrac_alpinus ~ ID+Series, data = alpinus_metadata, perm=999, na.rm = TRUE)
+alpinus_permanova_bray_2 <- adonis(dist.uunifrac_alpinus ~ Sex, data = alpinus_metadata, perm=999, na.rm = TRUE)
+alpinus_permanova_bray_1[["aov.tab"]]
+alpinus_permanova_bray_2[["aov.tab"]]
+
+
+{r betadiversity stats}
+library(betapart)
+library(vegan)
+
+##betadisper
+
+#Series_bray
+series.bd_bray <- betadisper(dist.bray, metadata$Series)
+anova(series.bd_bray)
+permutest(series.bd_bray)
+#Series_uunifrac
+series.bd_uunifrac <- betadisper(dist.uunifrac, metadata$Series)
+anova(series.bd_uunifrac)
+permutest(series.bd_uunifrac)
+#Series_wunifrac
+series.bd_wunifrac <- betadisper(dist.wunifrac, metadata$Series)
+anova(series.bd_wunifrac)
+permutest(series.bd_wunifrac)
+
+#ID_bray
+ID.bd_bray <- betadisper(dist.bray, metadata$ID)
+anova(ID.bd_bray)
+permutest(ID.bd_bray)
+#ID_uunifrac
+ID.bd_unifrac <- betadisper(dist.uunifrac, metadata$ID)
+anova(ID.bd_uunifrac)
+permutest(ID.bd_uunifrac)
+#ID_wunifrac
+ID.bd_wunifrac <- betadisper(dist.wunifrac, metadata$ID)
+anova(ID.bd_wunifrac)
+permutest(ID.bd_wunifrac)
+
+#Sex_bray
+sex.bd_bray <- betadisper(dist.bray, metadata$Sex)
+anova(sex.bd_bray)
+permutest(sex.bd_bray)
+#Sex_uunifrac
+sex.bd_uunifrac <- betadisper(dist.uunifrac, metadata$Sex)
+anova(sex.bd_uunifrac)
+permutest(sex.bd_uunifrac)
+#Sex_wunifrac
+sex.bd_wunifrac <- betadisper(dist.wunifrac, metadata$Sex)
+anova(sex.bd_wunifrac)
+permutest(sex.bd_wunifrac)
+
+#Species_bray
+species.bd_bray <- betadisper(dist.bray, metadata$Species)
+anova(species.bd_bray)
+permutest(species.bd_bray)
+#Species_uunifrac
+species.bd_uunifrac <- betadisper(dist.uunifrac, metadata$Species)
+anova(species.bd_uunifrac)
+permutest(species.bd_uunifrac)
+#Species_wunifrac
+species.bd_wunifrac <- betadisper(dist.wunifrac, metadata$Species)
+anova(species.bd_wunifrac)
+permutest(species.bd_wunifrac)
+
+#Series_canutus_bray
+series_canutus.bd_bray <- betadisper(dist.bray_canutus, metadata$Series)
+anova(series_canutus.bd_bray)
+permutest(series_canutus.bd_bray)
+#Series_canusut_uunifrac
+series_canutus.bd_uunifrac <- betadisper(dist.uunifrac_canutus, metadata$Series)
+anova(series_canutus.bd_uunifrac)
+permutest(series_canutus.bd_uunifrac)
+#Series_canutus_wunifrac
+series_canutus.bd_wunifrac <- betadisper(dist.wunifrac_canutus, metadata$Series)
+anova(series_canutus.bd_wunifrac)
+permutest(series_canutus.bd_wunifrac)
+
+#Series_alpinus_bray
+series_alpinus.bd_bray <- betadisper(dist.bray_alpinus, metadata$Series)
+anova(series_alpinus.bd_bray)
+permutest(series_alpinus.bd_bray)
+#Series_alpinus_uunifrac
+series_alpinus.bd_uunifrac <- betadisper(dist.uunifrac_alpinus, metadata$Series)
+anova(series_alpinus.bd_uunifrac)
+permutest(series_alpinus.bd_uunifrac)
+#Series_alpinus_wunifrac
+series_alpinus.bd_wunifrac <- betadisper(dist.wunifrac_alpinus, metadata$Series)
+anova(series_alpinus.bd_wunifrac)
+permutest(series_alpinus.bd_wunifrac)
+
+#ID_canutus_bray
+ID_canutus.bd_bray <- betadisper(dist.bray_canutus, canutus_metadata$ID)
+anova(ID_canutus.bd_bray)
+permutest(ID_canutus.bd_bray)
+#ID_canutus_uunifrac
+ID_canutus.bd_uunifrac <- betadisper(dist.uunifrac_canutus, canutus_metadata$ID)
+anova(ID_canutus.bd_uunifrac)
+permutest(ID_canutus.bd_uunifrac)
+#ID_canutus_wunifrac
+ID_canutus.bd_wunifrac <- betadisper(dist.wunifrac_canutus, canutus_metadata$ID)
+anova(ID_canutus.bd_wunifrac)
+permutest(ID_canutus.bd_wunifrac)
+
+#ID_alpinus_bray
+ID_alpinus.bd_bray <- betadisper(dist.bray_alpinus, alpinus_metadata$ID)
+anova(ID_alpinus.bd_bray)
+permutest(ID_alpinus.bd_bray)
+#ID_alpinus_uunifrac
+ID_alpinus.bd_uunifrac <- betadisper(dist.uunifrac_alpinus, alpinus_metadata$ID)
+anova(ID_alpinus.bd_uunifrac)
+permutest(ID_alpinus.bd_uunifrac)
+#ID_alpinus_wunifrac
+ID_alpinus.bd_wunifrac <- betadisper(dist.wunifrac_alpinus, alpinus_metadata$ID)
+anova(ID_alpinus.bd_wunifrac)
+permutest(ID_alpinus.bd_wunifrac)
+
+#Sex_canutus_bray
+sex_canutus.bd_bray <- betadisper(dist.bray_canutus, canutus_metadata$Sex)
+anova(sex_canutus.bd_bray)
+permutest(sex_canutus.bd_bray)
+#Sex_canutus_uunifrac
+sex_canutus.bd_uunifrac <- betadisper(dist.uunifrac_canutus, canutus_metadata$Sex)
+anova(sex_canutus.bd_uunifrac)
+permutest(sex_canutus.bd_uunifrac)
+#Sex_canutus_wunifrac
+sex_canutus.bd_wunifrac <- betadisper(dist.wunifrac_canutus, canutus_metadata$Sex)
+anova(sex_canutus.bd_wunifrac)
+permutest(sex_canutus.bd_wunifrac)
+
+#Sex_alpinus_bray
+sex_alpinus.bd_bray <- betadisper(dist.bray_alpinus, alpinus_metadata$Sex)
+anova(sex_alpinus.bd_bray)
+permutest(sex_alpinus.bd_bray)
+#Sex_alpinus_uunifrac
+sex_alpinus.bd_uunifrac <- betadisper(dist.uunifrac_alpinus, alpinus_metadata$Sex)
+anova(sex_alpinus.bd_uunifrac)
+permutest(sex_alpinus.bd_uunifrac)
+#Sex_alpinus_wunifrac
+sex_alpinus.bd_wunifrac <- betadisper(dist.wunifrac_alpinus, alpinus_metadata$Sex)
+anova(sex_alpinus.bd_wunifrac)
+permutest(sex_alpinus.bd_wunifrac)
+
+### HISTOGRAMME ###
+#devtools::install_github("hms-dbmi/UpSetR")
+library(UpSetR)
+library(ggplot2)
+library(grid)
+library(plyr)
+library(paletteer)
+
+##Histogramme PHYLUM
+
+ps.rel = transform_sample_counts(ps_gut, function(x) x/sum(x)*100)
+# agglomerate taxa
+glom.phylum <- tax_glom(ps.rel, taxrank = 'Phylum', NArm = FALSE)
+ps.melt.phylum <- psmelt(glom.phylum)
+# change to character for easy-adjusted level
+ps.melt.phylum$Phylum <- as.character(ps.melt.phylum$Phylum)
+
+ps.melt.phylum <- ps.melt.phylum %>%
+  group_by(ID, sample_Species, Phylum) %>%
+  mutate(median=median(Abundance))
+
+# select group median > 5
+keep.phy <- unique(ps.melt.phylum$Phylum[ps.melt.phylum$Abundance > 5])
+ps.melt.phylum$Phylum[!(ps.melt.phylum$Phylum %in% keep.phy)] <- "< 5%"
+
+
+ggplot(ps.melt.phylum, aes(x = Series, y = Abundance, fill = Phylum)) + 
+  geom_bar(stat = "identity", aes(fill=Phylum)) + 
+  labs(x="Samples Series", y="Abundance (%)", title="Samples bacterial phylum abundance") +
+  facet_wrap(~ID, scales= "free_x", nrow=1, as.table=FALSE, switch = "x") +
+  theme_classic() + 
+  theme(strip.background = element_blank(), 
+        axis.text.x.bottom = element_text(angle = 0),plot.title = element_text(hjust=0.5))+
+  scale_fill_manual("legend", values = paletteer_d("ggsci::default_ucscgb"))
+
+
+##Histogramme FAMILY
+
+ps.rel.family = transform_sample_counts(ps_gut, function(x) x/sum(x)*100)
+# agglomerate taxa
+glom.family <- tax_glom(ps.rel.family, taxrank = 'Family', NArm = FALSE)
+ps.melt.family <- psmelt(glom.family)
+# change to character for easy-adjusted level
+ps.melt.family$Family <- as.character(ps.melt.family$Family)
+
+ps.melt.family <- ps.melt.family %>%
+  group_by(ID, sample_Species, Family) %>%
+  mutate(median=median(Abundance))
+
+# select group median > 10
+keep.fam <- unique(ps.melt.family$Family[ps.melt.family$Abundance > 10])
+ps.melt.family$Family[!(ps.melt.family$Family %in% keep.fam)] <- "< 10%"
+
+
+ggplot(ps.melt.family, aes(x = Series, y = Abundance, fill = Family)) + 
+  geom_bar(stat = "identity", aes(fill=Family)) + 
+  labs(x="Samples Series", y="Abundance (%)", title="Samples bacterial families abundance") +
+  facet_wrap(~ID, scales= "free_x", nrow=1, as.table=FALSE, switch = "x") +
+  theme_classic() + 
+  theme(strip.background = element_blank(), 
+        axis.text.x.bottom = element_text(angle = 0),plot.title = element_text(hjust=0.5))+
+  scale_fill_manual("legend", values = paletteer_d("ggsci::default_ucscgb"))
+
+
+#Histogramme only Canutus
+metadata_canutus = read.table(file="metadata_canutus_MB.csv", sep=",", header=TRUE, row.names =c(1))
+
+
+#construct Canutus phyloseq object
+ps_gut_canutus <- phyloseq(otu_table(seqtab.nochim, taxa_are_rows=FALSE), 
+                           sample_data(metadata_canutus), 
+                           tax_table(taxa),phy_tree(fitGTR$tree))
+#remove non-target
+ps_gut_canutus <- ps_gut_canutus %>%
+  subset_taxa(
+    Kingdom == "Bacteria" &
+      Family  != "mitochondria" &
+      Class   != "Chloroplast")
+
+allTaxa_canutus = taxa_names(ps_gut_canutus)
+#allTaxa <- allTaxa[!(allTaxa %in% BadTaxa)]
+ps_gut_canutus = prune_taxa(allTaxa_canutus, ps_gut_canutus)
+ps_gut_canutus
+
+ps_gut_rarefied_canutus = rarefy_even_depth(ps_gut_canutus)
+
+##Histogramme family canutus
+ps.rel.family_canutus = transform_sample_counts(ps_gut_canutus, function(x) x/sum(x)*100)
+# agglomerate taxa
+glom.family_canutus <- tax_glom(ps.rel.family_canutus, taxrank = 'Family', NArm = FALSE)
+ps.melt.family_canutus <- psmelt(glom.family_canutus)
+# change to character for easy-adjusted level
+ps.melt.family_canutus$Family <- as.character(ps.melt.family_canutus$Family)
+
+ps.melt.family_canutus <- ps.melt.family_canutus %>%
+  group_by(ID, sample_Species, Family) %>%
+  mutate(median=median(Abundance))
+
+# select group median > 10
+keep.fam.canu <- unique(ps.melt.family_canutus$Family[ps.melt.family_canutus$Abundance > 10])
+ps.melt.family_canutus$Family[!(ps.melt.family_canutus$Family %in% keep.fam.canu)] <- "< 10%"
+
+
+ggplot(ps.melt.family_canutus, aes(x = Series, y = Abundance, fill = Family)) + 
+  geom_bar(stat = "identity", aes(fill=Family)) + 
+  labs(x="Samples Series", y="Abundance (%)", title="Calidris canutus samples bacterial families abundance") +
+  facet_wrap(~ID, scales= "free_x", nrow=1, as.table=FALSE, switch = "x") +
+  theme_classic() + 
+  theme(strip.background = element_blank(), 
+        axis.text.x.bottom = element_text(angle = 0),plot.title = element_text(hjust=0.5))+
+  scale_fill_manual("legend", values = paletteer_d("ggsci::default_ucscgb"))
+
+##Histogramme phylum canutus
+ps.rel.phylum_canutus = transform_sample_counts(ps_gut_canutus, function(x) x/sum(x)*100)
+# agglomerate taxa
+glom.phylum_canutus <- tax_glom(ps.rel.phylum_canutus, taxrank = 'Phylum', NArm = FALSE)
+ps.melt.phylum_canutus <- psmelt(glom.phylum_canutus)
+# change to character for easy-adjusted level
+ps.melt.phylum_canutus$Phylum <- as.character(ps.melt.phylum_canutus$Phylum)
+
+ps.melt.phylum_canutus <- ps.melt.phylum_canutus %>%
+  group_by(ID, sample_Species, Phylum) %>%
+  mutate(median=median(Abundance))
+
+# select group median > 5
+keep.phy.canu <- unique(ps.melt.phylum_canutus$Phylum[ps.melt.phylum_canutus$Abundance > 5])
+ps.melt.phylum_canutus$Phylum[!(ps.melt.phylum_canutus$Phylum %in% keep.phy.canu)] <- "< 5%"
+
+
+ggplot(ps.melt.phylum_canutus, aes(x = Series, y = Abundance, fill = Family)) + 
+  geom_bar(stat = "identity", aes(fill=Phylum)) + 
+  labs(x="Samples Series", y="Abundance (%)", title="Calidris canutus samples bacterial phylum abundance") +
+  facet_wrap(~ID, scales= "free_x", nrow=1, as.table=FALSE, switch = "x") +
+  theme_classic() + 
+  theme(strip.background = element_blank(), 
+        axis.text.x.bottom = element_text(angle = 0),plot.title = element_text(hjust=0.5))+
+  scale_fill_manual("legend", values = paletteer_d("ggsci::default_ucscgb"))
+
+
+#Histogramme alpina
+metadata_alpinus = read.table(file="metadata_alpinus_MB.csv", sep=",", header=TRUE, row.names =c(1))
+
+
+#construct alpina phyloseq object
+ps_gut_alpinus <- phyloseq(otu_table(seqtab.nochim, taxa_are_rows=FALSE), 
+                   sample_data(metadata_alpinus), 
+                   tax_table(taxa),phy_tree(fitGTR$tree))
+#remove non-target
+ps_gut_alpinus <- ps_gut_alpinus %>%
+  subset_taxa(
+    Kingdom == "Bacteria" &
+      Family  != "mitochondria" &
+      Class   != "Chloroplast")
+
+allTaxa_alpinus = taxa_names(ps_gut_alpinus)
+#allTaxa <- allTaxa[!(allTaxa %in% BadTaxa)]
+ps_gut_alpinus = prune_taxa(allTaxa_alpinus, ps_gut_alpinus)
+ps_gut_alpinus
+
+ps_gut_rarefied_alpinus = rarefy_even_depth(ps_gut_alpinus)
+
+##Histogramme family alpina
+ps.rel.family_alpinus = transform_sample_counts(ps_gut_alpinus, function(x) x/sum(x)*100)
+# agglomerate taxa
+glom.family_alpinus <- tax_glom(ps.rel.family_alpinus, taxrank = 'Family', NArm = FALSE)
+ps.melt.family_alpinus <- psmelt(glom.family_alpinus)
+# change to character for easy-adjusted level
+ps.melt.family_alpinus$Family <- as.character(ps.melt.family_alpinus$Family)
+
+ps.melt.family_alpinus <- ps.melt.family_alpinus %>%
+  group_by(ID, sample_Species, Family) %>%
+  mutate(median=median(Abundance))
+
+# select group median > 10
+keep.fam.alpi <- unique(ps.melt.family_alpinus$Family[ps.melt.family_alpinus$Abundance > 10])
+ps.melt.family_alpinus$Family[!(ps.melt.family_alpinus$Family %in% keep.fam.alpi)] <- "< 10%"
+
+
+ggplot(ps.melt.family_alpinus, aes(x = Series, y = Abundance, fill = Family)) + 
+  geom_bar(stat = "identity", aes(fill=Family)) + 
+  labs(x="Samples Series", y="Abundance (%)", title="Calidris alpinus samples bacterial families abundance") +
+  facet_wrap(~ID, scales= "free_x", nrow=1, as.table=FALSE, switch = "x") +
+  theme_classic() + 
+  theme(strip.background = element_blank(), 
+        axis.text.x.bottom = element_text(angle = 0),plot.title = element_text(hjust=0.5))+
+  scale_fill_manual("legend", values = paletteer_d("ggsci::default_ucscgb"))
+
+##Histogramme phylum alpina
+ps.rel.phylum_alpinus = transform_sample_counts(ps_gut_alpinus, function(x) x/sum(x)*100)
+# agglomerate taxa
+glom.phylum_alpinus <- tax_glom(ps.rel.phylum_alpinus, taxrank = 'Phylum', NArm = FALSE)
+ps.melt.phylum_alpinus <- psmelt(glom.phylum_alpinus)
+# change to character for easy-adjusted level
+ps.melt.phylum_alpinus$Phylum <- as.character(ps.melt.phylum_alpinus$Phylum)
+
+ps.melt.phylum_alpinus <- ps.melt.phylum_alpinus %>%
+  group_by(ID, sample_Species, Phylum) %>%
+  mutate(median=median(Abundance))
+
+# select group median > 5
+keep.phy.alpi <- unique(ps.melt.phylum_alpinus$Phylum[ps.melt.phylum_alpinus$Abundance > 5])
+ps.melt.phylum_alpinus$Phylum[!(ps.melt.phylum_alpinus$Phylum %in% keep.phy.alpi)] <- "< 5%"
+
+
+ggplot(ps.melt.phylum_alpinus, aes(x = Series, y = Abundance, fill = Family)) + 
+  geom_bar(stat = "identity", aes(fill=Phylum)) + 
+  labs(x="Samples Series", y="Abundance (%)", title="Calidris alpinus samples bacterial phylum abundance") +
+  facet_wrap(~ID, scales= "free_x", nrow=1, as.table=FALSE, switch = "x") +
+  theme_classic() + 
+  theme(strip.background = element_blank(), 
+        axis.text.x.bottom = element_text(angle = 0),plot.title = element_text(hjust=0.5))+
+  scale_fill_manual("legend", values = paletteer_d("ggsci::default_ucscgb"))
+
+
+{Tree with unifrac values}
+
+library(phangorn)
+
+#Uunifrac
+tree_upgma.uunifrac <- upgma(dist.uunifrac, method="average")
+#plot(tree_upgma.uunifrac)
+plot(tree_upgma.uunifrac, type="phylogram", direction="upwards", cex=0.5, no.margin = TRUE)
+plot(tree_upgma.uunifrac, type="phylogram", cex=0.5, no.margin = TRUE)
+
+#Wunifrac
+tree_upgma.wunifrac <- upgma(dist.wunifrac, method="average")
+#plot(tree_upgma.wunifrac)
+plot(tree_upgma.wunifrac, type="phylogram", direction="upwards", cex=0.5, no.margin = TRUE)
+plot(tree_upgma.wunifrac, type="phylogram", cex=0.5, no.margin = TRUE)
